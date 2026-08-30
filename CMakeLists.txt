@@ -5,16 +5,11 @@ project(ResonanceSuppressor VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Universal Binary auf macOS (Intel + Apple Silicon)
 if (APPLE)
     set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "" FORCE)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "" FORCE)
 endif()
 
-# ---------------------------------------------------------------------------
-# JUCE wird beim Konfigurieren automatisch heruntergeladen.
-# Kein Submodul, kein manueller Download noetig.
-# ---------------------------------------------------------------------------
 include(FetchContent)
 
 FetchContent_Declare(
@@ -25,15 +20,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(JUCE)
 
-# ---------------------------------------------------------------------------
-# Plugin-Target
-# ---------------------------------------------------------------------------
 juce_add_plugin(ResonanceSuppressor
     COMPANY_NAME                "danistbe"
     BUNDLE_ID                   "com.danistbe.resonancesuppressor"
-    PLUGIN_MANUFACTURER_CODE    Dnst          # 4 Zeichen, erster gross
-    PLUGIN_CODE                 Rsup          # 4 Zeichen, eindeutig pro Plugin
-    FORMATS                     VST3 AU       # AU wird nur auf macOS gebaut
+    PLUGIN_MANUFACTURER_CODE    Dnst
+    PLUGIN_CODE                 Rsup
+    FORMATS                     VST3 AU
     PRODUCT_NAME                "Resonance Suppressor"
     IS_SYNTH                    FALSE
     NEEDS_MIDI_INPUT            FALSE
@@ -48,6 +40,7 @@ juce_add_plugin(ResonanceSuppressor
 target_sources(ResonanceSuppressor
     PRIVATE
         Source/PluginProcessor.cpp
+        Source/PluginEditor.cpp
 )
 
 target_compile_definitions(ResonanceSuppressor
