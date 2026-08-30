@@ -7,9 +7,11 @@ namespace ParamID
     static constexpr auto detail  = "detail";
     static constexpr auto attack  = "attack";
     static constexpr auto release = "release";
+    static constexpr auto maxcut  = "maxcut";
     static constexpr auto mix     = "mix";
     static constexpr auto output  = "output";
     static constexpr auto bypass  = "bypass";
+    static constexpr auto delta   = "delta";
 }
 
 //==============================================================================
@@ -23,8 +25,11 @@ ResonanceSuppressorProcessor::ResonanceSuppressorProcessor()
     detailParam  = apvts.getRawParameterValue (ParamID::detail);
     attackParam  = apvts.getRawParameterValue (ParamID::attack);
     releaseParam = apvts.getRawParameterValue (ParamID::release);
+    maxCutParam  = apvts.getRawParameterValue (ParamID::maxcut);
     mixParam     = apvts.getRawParameterValue (ParamID::mix);
     outputParam  = apvts.getRawParameterValue (ParamID::output);
+    bypassParam  = apvts.getRawParameterValue (ParamID::bypass);
+    deltaParam   = apvts.getRawParameterValue (ParamID::delta);
 }
 
 //==============================================================================
@@ -51,6 +56,10 @@ ResonanceSuppressorProcessor::createParameterLayout()
         NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f));
 
     layout.add (std::make_unique<AudioParameterFloat> (
+        ParameterID { ParamID::maxcut, 1 }, "Max Cut",
+        NormalisableRange<float> (0.0f, 40.0f, 0.1f), 40.0f));
+
+    layout.add (std::make_unique<AudioParameterFloat> (
         ParameterID { ParamID::mix, 1 }, "Mix",
         NormalisableRange<float> (0.0f, 100.0f, 0.1f), 100.0f));
 
@@ -61,21 +70,42 @@ ResonanceSuppressorProcessor::createParameterLayout()
     layout.add (std::make_unique<AudioParameterBool> (
         ParameterID { ParamID::bypass, 1 }, "Bypass", false));
 
+    layout.add (std::make_unique<AudioParameterBool> (
+        ParameterID { ParamID::delta, 1 }, "Delta", false));
+
     return layout;
 }
 
 //==============================================================================
 void ResonanceSuppressorProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    juce::ignoreUnused (samplesPerBlock);
-
     currentSampleRate = sampleRate;
+
+    const auto numCh = juce::jmax (1, getTotalNumInputChannels());
+
+    engines.clear();
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        auto e = std::make_unique<SpectralEngine>();
+        e->prepare (sampleRate);
+        engines.push_back (std::move (e));
+    }
+
+    delayLength = SpectralEngine::getLatencySamples();
+    delayLine.setSize (numCh, delayLength);
+    delayLine.clear();
+    delayWritePos = 0;
+
+    dryBuffer.setSize (numCh, samplesPerBlock);
+    dryBuffer.clear();
 
     outputGain.reset (sampleRate, 0.02);
     outputGain.setCurrentAndTargetValue (juce::Decibels::decibelsToGain (outputParam->load()));
 
-    // Noch keine zusaetzliche Latenz - kommt mit der STFT-Engine.
-    setLatencySamples (0);
+    mixAmount.reset (sampleRate, 0.02);
+    mixAmount.setCurrentAndTargetValue (mixParam->load() * 0.01f);
+
+    setLatencySamples (SpectralEngine::getLatencySamples());
 }
 
 void ResonanceSuppressorProcessor::releaseResources()
@@ -87,10 +117,7 @@ bool ResonanceSuppressorProcessor::isBusesLayoutSupported (const BusesLayout& la
     const auto in  = layouts.getMainInputChannelSet();
     const auto out = layouts.getMainOutputChannelSet();
 
-    if (in.isDisabled() || out.isDisabled())
-        return false;
-
-    if (in != out)
+    if (in.isDisabled() || out.isDisabled() || in != out)
         return false;
 
     return in == juce::AudioChannelSet::mono()
@@ -102,28 +129,85 @@ void ResonanceSuppressorProcessor::processBlock (juce::AudioBuffer<float>& buffe
                                                  juce::MidiBuffer& midi)
 {
     juce::ignoreUnused (midi);
-
     juce::ScopedNoDenormals noDenormals;
 
-    const auto numIn  = getTotalNumInputChannels();
-    const auto numOut = getTotalNumOutputChannels();
+    const auto numIn      = getTotalNumInputChannels();
+    const auto numOut     = getTotalNumOutputChannels();
+    const auto numSamples = buffer.getNumSamples();
 
     for (int ch = numIn; ch < numOut; ++ch)
-        buffer.clear (ch, 0, buffer.getNumSamples());
+        buffer.clear (ch, 0, numSamples);
 
-    // ------------------------------------------------------------------
-    // Hier kommt spaeter das eigentliche Processing hin.
-    // Aktuell nur Output Gain, damit die Signalkette schon steht.
-    // ------------------------------------------------------------------
+    const auto numCh = juce::jmin ((int) engines.size(), numIn);
 
+    if (numCh == 0 || delayLength <= 0)
+        return;
+
+    // ---- Trockensignal sichern und verzoegern ---------------------------
+    if (dryBuffer.getNumSamples() < numSamples)
+        dryBuffer.setSize (numCh, numSamples, false, false, true);
+
+    for (int ch = 0; ch < numCh; ++ch)
+        dryBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
+
+    {
+        int wp = delayWritePos;
+
+        for (int n = 0; n < numSamples; ++n)
+        {
+            for (int ch = 0; ch < numCh; ++ch)
+            {
+                const float in  = dryBuffer.getSample (ch, n);
+                const float out = delayLine.getSample (ch, wp);
+                delayLine.setSample (ch, wp, in);
+                dryBuffer.setSample (ch, n, out);
+            }
+
+            if (++wp >= delayLength)
+                wp = 0;
+        }
+
+        delayWritePos = wp;
+    }
+
+    // ---- Wet-Pfad -------------------------------------------------------
+    const float depth   = depthParam->load();
+    const float detail  = detailParam->load();
+    const float attack  = attackParam->load();
+    const float release = releaseParam->load();
+    const float maxCut  = maxCutParam->load();
+
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        engines[(size_t) ch]->setParameters (depth, detail, attack, release, maxCut);
+        engines[(size_t) ch]->process (buffer.getWritePointer (ch), numSamples);
+    }
+
+    // ---- Delta / Mix / Bypass / Output ----------------------------------
+    const bool bypassed = bypassParam->load() > 0.5f;
+    const bool delta    = deltaParam->load() > 0.5f;
+
+    mixAmount .setTargetValue (mixParam->load() * 0.01f);
     outputGain.setTargetValue (juce::Decibels::decibelsToGain (outputParam->load()));
 
-    for (int i = 0; i < buffer.getNumSamples(); ++i)
+    for (int n = 0; n < numSamples; ++n)
     {
-        const auto g = outputGain.getNextValue();
+        const float mix = mixAmount.getNextValue();
+        const float g   = outputGain.getNextValue();
 
-        for (int ch = 0; ch < numOut; ++ch)
-            buffer.getWritePointer (ch)[i] *= g;
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            const float dry = dryBuffer.getSample (ch, n);
+            const float wet = buffer.getSample (ch, n);
+
+            float y;
+
+            if (bypassed)          y = dry;                      // Soft Bypass
+            else if (delta)        y = (dry - wet) * g;          // nur das Entfernte
+            else                   y = (dry + mix * (wet - dry)) * g;
+
+            buffer.setSample (ch, n, y);
+        }
     }
 }
 
@@ -144,7 +228,6 @@ void ResonanceSuppressorProcessor::setStateInformation (const void* data, int si
 //==============================================================================
 juce::AudioProcessorEditor* ResonanceSuppressorProcessor::createEditor()
 {
-    // Vorlaeufige Oberflaeche. Wird spaeter durch den Frequenzgraph ersetzt.
     return new juce::GenericAudioProcessorEditor (*this);
 }
 
