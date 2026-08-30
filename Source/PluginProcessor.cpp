@@ -1,4 +1,5 @@
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
 
 //==============================================================================
 namespace ParamID
@@ -81,22 +82,18 @@ void ResonanceSuppressorProcessor::prepareToPlay (double sampleRate, int samples
 {
     currentSampleRate = sampleRate;
 
-    const auto numCh = juce::jmax (1, getTotalNumInputChannels());
+    const int numCh = juce::jlimit (1, maxChannels, getTotalNumInputChannels());
+    activeChannels.store (numCh);
 
-    engines.clear();
-    for (int ch = 0; ch < numCh; ++ch)
-    {
-        auto e = std::make_unique<SpectralEngine>();
-        e->prepare (sampleRate);
-        engines.push_back (std::move (e));
-    }
+    for (auto& e : engines)
+        e.prepare (sampleRate);
 
     delayLength = SpectralEngine::getLatencySamples();
-    delayLine.setSize (numCh, delayLength);
+    delayLine.setSize (maxChannels, delayLength);
     delayLine.clear();
     delayWritePos = 0;
 
-    dryBuffer.setSize (numCh, samplesPerBlock);
+    dryBuffer.setSize (maxChannels, juce::jmax (1, samplesPerBlock));
     dryBuffer.clear();
 
     outputGain.reset (sampleRate, 0.02);
@@ -131,25 +128,25 @@ void ResonanceSuppressorProcessor::processBlock (juce::AudioBuffer<float>& buffe
     juce::ignoreUnused (midi);
     juce::ScopedNoDenormals noDenormals;
 
-    const auto numIn      = getTotalNumInputChannels();
-    const auto numOut     = getTotalNumOutputChannels();
-    const auto numSamples = buffer.getNumSamples();
+    const int numIn      = getTotalNumInputChannels();
+    const int numOut     = getTotalNumOutputChannels();
+    const int numSamples = buffer.getNumSamples();
 
     for (int ch = numIn; ch < numOut; ++ch)
         buffer.clear (ch, 0, numSamples);
 
-    const auto numCh = juce::jmin ((int) engines.size(), numIn);
+    const int numCh = juce::jmin (maxChannels, numIn);
 
-    if (numCh == 0 || delayLength <= 0)
+    if (numCh <= 0 || delayLength <= 0 || numSamples <= 0)
         return;
 
-    // ---- Trockensignal sichern und verzoegern ---------------------------
     if (dryBuffer.getNumSamples() < numSamples)
-        dryBuffer.setSize (numCh, numSamples, false, false, true);
+        dryBuffer.setSize (maxChannels, numSamples, false, false, true);
 
     for (int ch = 0; ch < numCh; ++ch)
         dryBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
 
+    // ---- Trockensignal um die Engine-Latenz verzoegern -------------------
     {
         int wp = delayWritePos;
 
@@ -179,8 +176,8 @@ void ResonanceSuppressorProcessor::processBlock (juce::AudioBuffer<float>& buffe
 
     for (int ch = 0; ch < numCh; ++ch)
     {
-        engines[(size_t) ch]->setParameters (depth, detail, attack, release, maxCut);
-        engines[(size_t) ch]->process (buffer.getWritePointer (ch), numSamples);
+        engines[(size_t) ch].setParameters (depth, detail, attack, release, maxCut);
+        engines[(size_t) ch].process (buffer.getWritePointer (ch), numSamples);
     }
 
     // ---- Delta / Mix / Bypass / Output ----------------------------------
@@ -202,9 +199,9 @@ void ResonanceSuppressorProcessor::processBlock (juce::AudioBuffer<float>& buffe
 
             float y;
 
-            if (bypassed)          y = dry;                      // Soft Bypass
-            else if (delta)        y = (dry - wet) * g;          // nur das Entfernte
-            else                   y = (dry + mix * (wet - dry)) * g;
+            if (bypassed)   y = dry;
+            else if (delta) y = (dry - wet) * g;
+            else            y = (dry + mix * (wet - dry)) * g;
 
             buffer.setSample (ch, n, y);
         }
@@ -228,7 +225,7 @@ void ResonanceSuppressorProcessor::setStateInformation (const void* data, int si
 //==============================================================================
 juce::AudioProcessorEditor* ResonanceSuppressorProcessor::createEditor()
 {
-    return new juce::GenericAudioProcessorEditor (*this);
+    return new ResonanceSuppressorEditor (*this);
 }
 
 //==============================================================================
