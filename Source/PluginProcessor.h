@@ -3,14 +3,9 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
 
-//==============================================================================
-/**
-    Resonance Suppressor - Geruest.
+#include "SpectralEngine.h"
 
-    Aktuell reines Pass-Through. Die Parameter existieren bereits, damit die
-    Host-Automation und der Preset-State von Anfang an stabil sind. Das DSP
-    kommt im naechsten Schritt in eine eigene Klasse.
-*/
+//==============================================================================
 class ResonanceSuppressorProcessor : public juce::AudioProcessor
 {
 public:
@@ -49,16 +44,29 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
-    // Zeiger auf haeufig gelesene Parameter. atomar, damit der Audio-Thread
-    // sie ohne Sperren lesen kann.
     std::atomic<float>* depthParam   { nullptr };
     std::atomic<float>* detailParam  { nullptr };
     std::atomic<float>* attackParam  { nullptr };
     std::atomic<float>* releaseParam { nullptr };
+    std::atomic<float>* maxCutParam  { nullptr };
     std::atomic<float>* mixParam     { nullptr };
     std::atomic<float>* outputParam  { nullptr };
+    std::atomic<float>* bypassParam  { nullptr };
+    std::atomic<float>* deltaParam   { nullptr };
+
+    // Ein Analyse-/Verarbeitungspfad pro Kanal. Vorerst Dual Mono,
+    // Stereo Link kommt spaeter.
+    std::vector<std::unique_ptr<SpectralEngine>> engines;
+
+    // Trockensignal muss um die Engine-Latenz verzoegert werden, sonst
+    // erzeugt der Mix-Regler Kammfilter.
+    juce::AudioBuffer<float> dryBuffer;
+    juce::AudioBuffer<float> delayLine;
+    int delayWritePos { 0 };
+    int delayLength { 0 };
 
     juce::SmoothedValue<float> outputGain;
+    juce::SmoothedValue<float> mixAmount;
 
     double currentSampleRate { 44100.0 };
 
