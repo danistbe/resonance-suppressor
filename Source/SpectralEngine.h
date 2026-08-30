@@ -2,39 +2,38 @@
 
 #include <juce_dsp/juce_dsp.h>
 #include <vector>
+#include <array>
+#include <atomic>
 #include <cmath>
 
 //==============================================================================
 /**
     Hochaufloesender spektraler Resonanz-Suppressor fuer einen Kanal.
 
-    Ablauf pro Frame:
-      1. FFT des gefensterten Eingangs
-      2. Magnitude in dB
-      3. lokaler spektraler Durchschnitt (gleitendes Fenster mit konstanter
-         relativer Bandbreite, ueber Praefixsummen in O(1) pro Bin)
-      4. prominence = magDb - localAvgDb
-      5. alles oberhalb einer Schwelle wird zur Absenkung
-      6. zeitliche Glaettung pro Bin, Attack/Release frequenzabhaengig
-      7. Gain-Maske leicht ueber die Frequenz glaetten (gegen Ringing)
-      8. IFFT, Fenster, Overlap-Add
-
     Die Anzahl unabhaengiger Absenkungen entspricht der Anzahl der Bins,
     nicht einer festen Bandzahl.
+
+    Fuer die Darstellung schreibt die Engine zwei Snapshots in Atomic-Arrays.
+    Der Audio-Thread schreibt nur, der Message-Thread liest nur. Beides
+    relaxed - kurzzeitig inkonsistente Werte sind fuer eine Anzeige egal.
 */
 class SpectralEngine
 {
 public:
     //==========================================================================
-    // Zentrale Konstanten. Groesseres fftOrder = feinere Frequenzaufloesung,
-    // aber mehr Latenz und traegere Zeitaufloesung.
     static constexpr int fftOrder = 11;              // 2^11 = 2048
     static constexpr int fftSize  = 1 << fftOrder;
     static constexpr int hopSize  = fftSize / 4;     // 75 % Overlap
     static constexpr int numBins  = fftSize / 2 + 1;
 
-    // Summe der quadrierten Hann-Fenster bei 75 % Overlap
     static constexpr float olaNorm = 1.0f / 1.5f;
+
+    //==========================================================================
+    SpectralEngine()
+    {
+        for (auto& v : displayReduction) v.store (0.0f,   std::memory_order_relaxed);
+        for (auto& v : displaySpectrum)  v.store (-100.0f, std::memory_order_relaxed);
+    }
 
     //==========================================================================
     void prepare (double sampleRate)
@@ -50,20 +49,20 @@ public:
         outputBuffer.assign ((size_t) fftSize, 0.0f);
         fftData     .assign ((size_t) fftSize * 2, 0.0f);
 
-        magDb        .assign ((size_t) numBins, -140.0f);
-        prefix       .assign ((size_t) numBins + 1, 0.0f);
-        reduction    .assign ((size_t) numBins, 0.0f);
-        gains        .assign ((size_t) numBins, 1.0f);
-        gainsTmp     .assign ((size_t) numBins, 1.0f);
-        attackCoef   .assign ((size_t) numBins, 0.5f);
-        releaseCoef  .assign ((size_t) numBins, 0.2f);
-        binFreq      .assign ((size_t) numBins, 0.0f);
+        magDb       .assign ((size_t) numBins, -140.0f);
+        prefix      .assign ((size_t) numBins + 1, 0.0f);
+        reduction   .assign ((size_t) numBins, 0.0f);
+        gains       .assign ((size_t) numBins, 1.0f);
+        gainsTmp    .assign ((size_t) numBins, 1.0f);
+        attackCoef  .assign ((size_t) numBins, 0.5f);
+        releaseCoef .assign ((size_t) numBins, 0.2f);
+        binFreq     .assign ((size_t) numBins, 0.0f);
 
         for (int k = 0; k < numBins; ++k)
             binFreq[(size_t) k] = (float) (k * sr / (double) fftSize);
 
         reset();
-        updateTimeCoefficients (true);
+        updateTimeCoefficients();
     }
 
     void reset()
@@ -78,8 +77,21 @@ public:
 
     static int getLatencySamples()  { return fftSize; }
 
+    double getSampleRate() const noexcept { return sr; }
+
+    /** Absenkung in dB, positiv. Nur fuer die Anzeige. */
+    float getDisplayReduction (int k) const noexcept
+    {
+        return displayReduction[(size_t) k].load (std::memory_order_relaxed);
+    }
+
+    /** Magnitude relativ zum Frame-Peak, also -100..0 dB. Nur fuer die Anzeige. */
+    float getDisplaySpectrum (int k) const noexcept
+    {
+        return displaySpectrum[(size_t) k].load (std::memory_order_relaxed);
+    }
+
     //==========================================================================
-    /** Alle Werte 0..100 ausser maxCutDb. Aufruf pro Block, nicht pro Sample. */
     void setParameters (float depth, float detail, float attack, float release, float maxCutDb)
     {
         depth01  = juce::jlimit (0.0f, 1.0f, depth  * 0.01f);
@@ -90,12 +102,11 @@ public:
         {
             lastAttack  = attack;
             lastRelease = release;
-            updateTimeCoefficients (false);
+            updateTimeCoefficients();
         }
     }
 
     //==========================================================================
-    /** In-place. Ergebnis ist das reine Wet-Signal, um fftSize verzoegert. */
     void process (float* data, int numSamples)
     {
         for (int n = 0; n < numSamples; ++n)
@@ -117,34 +128,26 @@ public:
 
 private:
     //==========================================================================
-    void updateTimeCoefficients (bool force)
+    void updateTimeCoefficients()
     {
-        juce::ignoreUnused (force);
-
         const float hopTime = (float) hopSize / (float) sr;
 
-        // 0.5 ms .. 50 ms  bzw.  10 ms .. 500 ms
         const float attackSec  = 0.0005f * std::pow (100.0f, lastAttack  * 0.01f);
         const float releaseSec = 0.010f  * std::pow (50.0f,  lastRelease * 0.01f);
 
         for (int k = 0; k < numBins; ++k)
         {
-            // Hohe Frequenzen duerfen schneller bearbeitet werden als tiefe.
             const float f     = juce::jmax (30.0f, binFreq[(size_t) k]);
             const float scale = juce::jlimit (0.35f, 4.0f, 1000.0f / f);
 
-            const float ta = attackSec  * scale;
-            const float tr = releaseSec * scale;
-
-            attackCoef [(size_t) k] = 1.0f - std::exp (-hopTime / juce::jmax (1.0e-5f, ta));
-            releaseCoef[(size_t) k] = 1.0f - std::exp (-hopTime / juce::jmax (1.0e-5f, tr));
+            attackCoef [(size_t) k] = 1.0f - std::exp (-hopTime / juce::jmax (1.0e-5f, attackSec  * scale));
+            releaseCoef[(size_t) k] = 1.0f - std::exp (-hopTime / juce::jmax (1.0e-5f, releaseSec * scale));
         }
     }
 
     //==========================================================================
     void processFrame()
     {
-        // ---- Fensterung -------------------------------------------------
         for (int i = 0; i < fftSize; ++i)
         {
             int idx = pos + i;
@@ -157,7 +160,6 @@ private:
 
         auto* cplx = reinterpret_cast<juce::dsp::Complex<float>*> (fftData.data());
 
-        // ---- Magnituden in dB -------------------------------------------
         float frameMax = -200.0f;
 
         for (int k = 0; k < numBins; ++k)
@@ -168,20 +170,15 @@ private:
             frameMax = juce::jmax (frameMax, d);
         }
 
-        // Alles mehr als 80 dB unter dem Frame-Peak ist Rauschen und wird
-        // nicht bearbeitet. Verhindert Chasing in leisen Passagen.
         const float noiseFloor = frameMax - 80.0f;
 
-        // ---- Praefixsummen fuer den lokalen Durchschnitt ------------------
         prefix[0] = 0.0f;
         for (int k = 0; k < numBins; ++k)
             prefix[(size_t) k + 1] = prefix[(size_t) k] + magDb[(size_t) k];
 
-        // Detail hoch = enges Vergleichsfenster = nur schmale Peaks fallen auf.
         const float relWidth = juce::jmap (detail01, 0.60f, 0.04f);
         const int   minWidth = juce::jmax (2, juce::roundToInt (juce::jmap (detail01, 24.0f, 3.0f)));
 
-        // Depth steuert Schwelle und Steigung gemeinsam.
         const float thresholdDb = juce::jmap (depth01, 12.0f, 1.5f);
         const float strength    = juce::jmap (depth01, 0.25f, 1.40f);
 
@@ -198,7 +195,7 @@ private:
 
                 if (n > 0)
                 {
-                    const float localAvg  = (prefix[(size_t) hi] - prefix[(size_t) lo]) / (float) n;
+                    const float localAvg   = (prefix[(size_t) hi] - prefix[(size_t) lo]) / (float) n;
                     const float prominence = magDb[(size_t) k] - localAvg;
                     const float excess     = prominence - thresholdDb;
 
@@ -207,7 +204,6 @@ private:
                 }
             }
 
-            // ---- zeitliche Glaettung ------------------------------------
             const float prev = reduction[(size_t) k];
             const float c    = (target > prev) ? attackCoef[(size_t) k]
                                                : releaseCoef[(size_t) k];
@@ -216,7 +212,6 @@ private:
             gainsTmp[(size_t) k] = std::pow (10.0f, -reduction[(size_t) k] / 20.0f);
         }
 
-        // ---- Gain-Maske ueber die Frequenz glaetten -----------------------
         gains[0] = gainsTmp[0];
         gains[(size_t) numBins - 1] = gainsTmp[(size_t) numBins - 1];
 
@@ -225,7 +220,6 @@ private:
                               + 0.50f * gainsTmp[(size_t) k]
                               + 0.25f * gainsTmp[(size_t) k + 1];
 
-        // ---- anwenden, inklusive konjugiert gespiegelter Haelfte ----------
         for (int k = 0; k < numBins; ++k)
         {
             cplx[k] *= gains[(size_t) k];
@@ -236,12 +230,19 @@ private:
 
         fft.performRealOnlyInverseTransform (fftData.data());
 
-        // ---- Overlap-Add -------------------------------------------------
         for (int i = 0; i < fftSize; ++i)
         {
             int idx = pos + i;
             if (idx >= fftSize) idx -= fftSize;
             outputBuffer[(size_t) idx] += fftData[(size_t) i] * window[(size_t) i] * olaNorm;
+        }
+
+        // ---- Snapshots fuer die Anzeige ----------------------------------
+        for (int k = 0; k < numBins; ++k)
+        {
+            displayReduction[(size_t) k].store (reduction[(size_t) k], std::memory_order_relaxed);
+            displaySpectrum [(size_t) k].store (juce::jmax (-100.0f, magDb[(size_t) k] - frameMax),
+                                                std::memory_order_relaxed);
         }
     }
 
@@ -262,5 +263,8 @@ private:
     std::vector<float> magDb, prefix, reduction, gains, gainsTmp;
     std::vector<float> attackCoef, releaseCoef, binFreq;
 
-    JUCE_LEAK_DETECTOR (SpectralEngine)
+    std::array<std::atomic<float>, (size_t) numBins> displayReduction;
+    std::array<std::atomic<float>, (size_t) numBins> displaySpectrum;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectralEngine)
 };
