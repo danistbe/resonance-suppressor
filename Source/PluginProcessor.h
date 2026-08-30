@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
+#include <array>
 
 #include "SpectralEngine.h"
 
@@ -9,6 +10,8 @@
 class ResonanceSuppressorProcessor : public juce::AudioProcessor
 {
 public:
+    static constexpr int maxChannels = 2;
+
     ResonanceSuppressorProcessor();
     ~ResonanceSuppressorProcessor() override = default;
 
@@ -41,6 +44,15 @@ public:
     //==========================================================================
     juce::AudioProcessorValueTreeState apvts;
 
+    /** Feste Anzahl Engines, damit der Editor nie auf einen ungueltigen
+        Zeiger laeuft, wenn prepareToPlay im Hintergrund neu konfiguriert. */
+    const SpectralEngine& getEngine (int ch) const noexcept
+    {
+        return engines[(size_t) juce::jlimit (0, maxChannels - 1, ch)];
+    }
+
+    int getActiveChannels() const noexcept { return activeChannels.load(); }
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -54,12 +66,9 @@ private:
     std::atomic<float>* bypassParam  { nullptr };
     std::atomic<float>* deltaParam   { nullptr };
 
-    // Ein Analyse-/Verarbeitungspfad pro Kanal. Vorerst Dual Mono,
-    // Stereo Link kommt spaeter.
-    std::vector<std::unique_ptr<SpectralEngine>> engines;
+    std::array<SpectralEngine, (size_t) maxChannels> engines;
+    std::atomic<int> activeChannels { 2 };
 
-    // Trockensignal muss um die Engine-Latenz verzoegert werden, sonst
-    // erzeugt der Mix-Regler Kammfilter.
     juce::AudioBuffer<float> dryBuffer;
     juce::AudioBuffer<float> delayLine;
     int delayWritePos { 0 };
